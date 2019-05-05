@@ -1,0 +1,329 @@
+#!/bin/env python
+
+# put this file in your local checks dir, for example: /usr/share/check-mk-agent/local
+# and make it executable: chmod +x /usr/share/check-mk-agent/local/puppet_agentrun
+
+# Check_MK puppet_agentrun
+#
+# Copyright 2019, Angelo Hongens <angelo[at]hongens.nl>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#
+#  put this file in your plugins dir, e.g. /usr/share/check-mk-agent/plugins
+
+# 29-07-2016 Angelo Hongens
+#
+# This script is used to parse the puppet-agent reports and decide whether
+# this agent is in a good state. Just using the last run is not good
+# enough, because reloading the puppet server will cause puppet-agent to
+# fail, and we don't want to send false alarms.
+# So, we're going to look at the latest run, and the run before. We will
+# store the last run into a temporary file and reuse those values in the
+# next run of this script.
+#
+# ??-??-2017 Ad Loos
+# I added a extra variable for this "agent_disabled" 0-> enabled , 1-> disabled.
+#
+# 29-12-2018 Angelo Hongens
+# Added support for scenario when there is no catalog (because of a syntax error or
+# facter problem, etc)
+
+import json
+import time
+import argparse
+import yaml
+import mmap
+import os
+from subprocess import PIPE, Popen
+
+flagVerbose = False
+
+# GLOBALS
+storagefile = "/tmp/puppetrun-stats.txt"
+
+path = '/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin:/opt/puppetlabs/bin:/root/bin'
+run_summary_file = Popen(['puppet config print lastrunfile --section=agent 2> /dev/null'],
+                         stdout=PIPE,
+                         shell=True,
+                         env=dict(os.environ, PATH=path)).communicate()[0].split()[0]
+agent_disabled_lockfile = Popen(['puppet config print agent_disabled_lockfile --section=agent 2> /dev/null'],
+                                stdout=PIPE, shell=True,
+                                env=dict(os.environ, PATH=path)).communicate()[0].split()[0]
+
+now = int(Popen(['date', '+%s'], stdout=PIPE).communicate()[0].split()[0])
+
+
+# class NagiosReturnCode(Enum):
+#     OK = 0
+#     WARN = 1
+#     CRIT = 2
+#     UNKNOWN = 3
+
+
+def print_checkmk_output(status, metrics, details):
+    # 0      myservice   myvalue=73;80;90  My output text which may contain spaces
+    #
+    # 1.	Status	The status of a service is given as a number: 0 for OK, 1 for WARN, 2 for CRIT and 3 for UNKNOWN.
+    # 2.	Service name	The service name as shown in Check_MK. This may not contain blanks. 3.	Metrics
+    # Performance values for the data. More information about the construction can be found later below. Alternatively
+    #  a minus sign can be coded if the check produces no metrics. 4.	Status details	Details for the status as they
+    #  will be shown in Check_MK. This part can also contain blanks.
+    servicename = "PuppetAgentRun"
+    print("{0} {1} {2} {3}".format(status, servicename, metrics, details))
+    exit(0)
+
+
+
+def humanize_time(amount, units='seconds'):
+    def process_time(amount, units):
+
+        INTERVALS = [1, 60,
+                     60 * 60,
+                     60 * 60 * 24,
+                     60 * 60 * 24 * 7,
+                     60 * 60 * 24 * 7 * 4,
+                     60 * 60 * 24 * 7 * 4 * 12,
+                     60 * 60 * 24 * 7 * 4 * 12 * 100,
+                     60 * 60 * 24 * 7 * 4 * 12 * 100 * 10]
+        NAMES = [('second', 'seconds'),
+                 ('minute', 'minutes'),
+                 ('hour', 'hours'),
+                 ('day', 'days'),
+                 ('week', 'weeks'),
+                 ('month', 'months'),
+                 ('year', 'years'),
+                 ('century', 'centuries'),
+                 ('millennium', 'millennia')]
+
+        result = []
+
+        unit = map(lambda a: a[1], NAMES).index(units)
+        # Convert to seconds
+        amount = amount * INTERVALS[unit]
+
+        for i in range(len(NAMES) - 1, -1, -1):
+            a = amount // INTERVALS[i]
+            if a > 0:
+                result.append((a, NAMES[i][1 % a]))
+                amount -= a * INTERVALS[i]
+
+        return result
+
+    rd = process_time(int(amount), units)
+    cont = 0
+    for u in rd:
+        if u[0] > 0:
+            cont += 1
+
+    buf = ''
+    i = 0
+    for u in rd:
+        if u[0] > 0:
+            buf += "%d %s" % (u[0], u[1])
+            cont -= 1
+
+        if i < (len(rd) - 1):
+            if cont > 1:
+                buf += ", "
+            else:
+                buf += " and "
+
+        i += 1
+
+    return buf
+
+
+def tail(filename, n):
+    # from http://stackoverflow.com/questions/136168/get-last-n-lines-of-a-file-with-python-similar-to-tail
+    # Returns last n lines from the filename. No exception handling
+    size = os.path.getsize(filename)
+    with open(filename, "rb") as f:
+        # for Windows the mmap parameters are different
+        fm = mmap.mmap(f.fileno(), 0, mmap.MAP_SHARED, mmap.PROT_READ)
+        try:
+            for i in xrange(size - 1, -1, -1):
+                if fm[i] == '\n':
+                    n -= 1
+                    if n == -1:
+                        break
+            return fm[i + 1 if i else 0:].splitlines()
+        finally:
+            fm.close()
+
+
+def add_to_storagefile(success, timestamp):
+    global exists, exists
+    datalist = []
+
+    try:
+        datalist = tail(storagefile, 2)  # gets the last 3 items!
+
+        # search the old records for a record with the current timestamp
+        exists = False
+        for record in datalist:
+            if "{0}".format(timestamp) in record:
+                exists = True
+
+        if flagVerbose:
+            print 'Does the current timestamp already exist in the store: {0}'.format(exists)
+
+        # if it already exists, don't add it. If it doesn't exist, add it!
+        if exists == 0:
+            datalist.append('{0}:{1}'.format(timestamp, success))
+
+    except (IOError, OSError):
+
+        if flagVerbose:
+            print 'Storagefile does not exist'
+
+        datalist.append('{0}:{1}'.format(timestamp, success))
+
+    if len(datalist) == 4:
+        datalist.remove(datalist[0])
+
+    with open(storagefile, 'w') as f:
+        f.write('\n'.join(datalist))
+        if flagVerbose:
+            print("  written to file: {0}".format(datalist))
+
+            # End of function
+
+
+def main():
+    global flagVerbose
+    # MAIN PROGRAM
+    # ##################################################
+    # Parse arguments
+    helptext = 'This program parses the puppet last run summary'
+    parser = argparse.ArgumentParser(description=helptext)
+    parser.add_argument('-v', '--verbose', action='store_true', help='show more output')
+    # store the results from parsing the args
+    args = parser.parse_args()
+    assert isinstance(args.verbose, bool)
+    flagVerbose = args.verbose
+
+    t1_main = time.time()
+
+    # ##################################################
+    # Go do some work
+
+    if flagVerbose:
+        print '  "run_summary_file"       : "{0}"'.format(run_summary_file)
+        print '  "storagefile"            : "{0}"'.format(storagefile)
+
+    #
+    # # DEFINE VARS
+    # # PHASE 1
+    if flagVerbose:
+        print 'PHASE 1: Getting the current values'
+
+    # first check the puppet agent is disabled.
+    agent_disabled = 0
+    if os.path.exists(agent_disabled_lockfile):
+        agent_disabled = 1
+        print_checkmk_output(1, "-", "Puppet agent is disabled")
+
+    try:
+        with open(run_summary_file, 'r') as f:
+            doc = yaml.load(f)
+
+            # see if we have a catalog. If not, we have a problem.
+            if doc['version']['config'] is None:
+                t0_failures = 1
+                if flagVerbose:
+                    print " there's no catalog, that's bad. "
+
+            else:
+                # check the failures
+                try:
+                    t0_failures = doc['events']['failure']
+
+                except KeyError:
+                    t0_failures = 1
+                    if flagVerbose:
+                        print "  the key 'failure' was not found in the yaml file, setting it to 1"
+            try:
+                t0_timestamp = doc['time']['last_run']
+
+            except KeyError:
+                print_checkmk_output(3, "-", "the key 'time.last_run' was not found in the yaml file")
+
+    except OSError as err:
+        print_checkmk_output(3, "-", "yaml file not found or access error: {0}".format(err.message))
+
+    if flagVerbose:
+        print '  "t0_failures"            : "{0}"'.format(t0_failures)
+        print '  "t0_timestamp"           : "{0}"'.format(t0_timestamp)
+
+    if flagVerbose:
+        print 'PHASE 2: If needed, add the values to the store'
+
+    t0_success = 0
+    if t0_failures < 1:
+        t0_success = 1
+
+    if flagVerbose:
+        print '  "t0_success"             : "{0}"'.format(t0_success)
+
+    add_to_storagefile(t0_success, t0_timestamp)
+
+    if flagVerbose:
+        print 'PHASE 3: Read values from file and parse'
+
+    datalist = tail(storagefile, 2)  # gets the last 3 items!
+    count_runs = 0
+    successful_runs = 0
+    last_run_timestamp = 0
+
+    for record in datalist:
+        count_runs += 1
+        successful_runs += int(record.split(':')[1])
+        last_run_timestamp = int(record.split(':')[0])
+
+    percentage_successful = (successful_runs * 100) / count_runs
+
+    last_run_secs = now - last_run_timestamp
+
+    if flagVerbose:
+        print '  count_runs              : {0}'.format(count_runs)
+        print '  successful_runs         : {0}'.format(successful_runs)
+        print '  percentage_successful   : {0}'.format(percentage_successful)
+        print '  now                     : {0}'.format(now)
+        print '  last_run_timestamp      : {0}'.format(last_run_timestamp)
+        print '  last_run_secs           : {0}'.format(last_run_secs)
+        print '  agent_disabled          : ', agent_disabled
+
+    warning_thresh_seconds = 3600
+    time_since_formatted = humanize_time(last_run_secs)
+
+    if last_run_secs > warning_thresh_seconds:
+        print_checkmk_output(2, "-", "last run {0} ago".format(time_since_formatted))
+
+    if percentage_successful >= 50:
+        message = '{0} of last runs successful, last run {1} ago'.format(percentage_successful, time_since_formatted)
+        print_checkmk_output(0, "-", message)
+    else:
+        message = '{0} of last runs successful, last run {1} ago'.format(percentage_successful, time_since_formatted)
+        print_checkmk_output(1, "-", message)
+
+    t2_main = time.time()
+    if flagVerbose:
+        print("PERF: processed entire script in {0} ms".format(int((t2_main - t1_main) * 1000)))
+
+
+# MAIN PROGRAM
+# ##################################################
+if __name__ == "__main__":
+    # stuff only to run when not called via 'import' here
+    main()
+
