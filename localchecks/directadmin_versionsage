@@ -1,0 +1,101 @@
+#!/bin/env python
+
+# put this file in your local checks dir, for example: /usr/share/check-mk-agent/local
+# and make it executable: chmod +x /usr/share/check-mk-agent/local/directadmin_versionsage
+import os
+import time
+
+versionsfile = "/usr/local/directadmin/custombuild/versions.txt"
+
+
+def print_checkmk_output(status, details):
+    # 0      myservice   myvalue=73;80;90  My output text which may contain spaces
+    #
+    # 1.	Status	The status of a service is given as a number: 0 for OK, 1 for WARN, 2 for CRIT and 3 for UNKNOWN.
+    # 2.	Service name	The service name as shown in Check_MK. This may not contain blanks. 3.	Metrics
+    # Performance values for the data. More information about the construction can be found later below. Alternatively
+    #  a minus sign can be coded if the check produces no metrics. 4.	Status details	Details for the status as they
+    #  will be shown in Check_MK. This part can also contain blanks.
+    servicename = "Directadmin_versionsage"
+    metrics = "-"
+    print("{0} {1} {2} {3}".format(status, servicename, metrics, details))
+    exit(0)
+
+
+def humanize_time(amount, units='seconds'):
+    def process_time(amount, units):
+
+        INTERVALS = [1, 60,
+                     60 * 60,
+                     60 * 60 * 24,
+                     60 * 60 * 24 * 7,
+                     60 * 60 * 24 * 7 * 4,
+                     60 * 60 * 24 * 7 * 4 * 12,
+                     60 * 60 * 24 * 7 * 4 * 12 * 100,
+                     60 * 60 * 24 * 7 * 4 * 12 * 100 * 10]
+        NAMES = [('second', 'seconds'),
+                 ('minute', 'minutes'),
+                 ('hour', 'hours'),
+                 ('day', 'days'),
+                 ('week', 'weeks'),
+                 ('month', 'months'),
+                 ('year', 'years'),
+                 ('century', 'centuries'),
+                 ('millennium', 'millennia')]
+
+        result = []
+
+        unit = map(lambda a: a[1], NAMES).index(units)
+        # Convert to seconds
+        amount = amount * INTERVALS[unit]
+
+        for i in range(len(NAMES) - 1, -1, -1):
+            a = amount // INTERVALS[i]
+            if a > 0:
+                result.append((a, NAMES[i][1 % a]))
+                amount -= a * INTERVALS[i]
+
+        return result
+
+    rd = process_time(int(amount), units)
+    cont = 0
+    for u in rd:
+        if u[0] > 0:
+            cont += 1
+
+    buf = ''
+    i = 0
+    for u in rd:
+        if u[0] > 0:
+            buf += "%d %s" % (u[0], u[1])
+            cont -= 1
+
+        if i < (len(rd) - 1):
+            if cont > 1:
+                buf += ", "
+            else:
+                buf += " and "
+
+        i += 1
+
+    return buf
+
+
+current_time = int(time.time())
+if os.path.exists(versionsfile):
+    mtime = int(os.path.getmtime(versionsfile))
+else:
+    print_checkmk_output(2, "file '{0}' not found".format(versionsfile))
+
+age_seconds = current_time - mtime
+formatted_age = humanize_time(age_seconds)
+message = "versions.txt is {0} old".format(formatted_age)
+
+if age_seconds > (90*24*3600):
+    # older than 90 days
+    print_checkmk_output(2, message)
+if age_seconds > (60*24*3600):
+    # older than 30 days
+    print_checkmk_output(1, message)
+# fresher than the above
+print_checkmk_output(0, message)
